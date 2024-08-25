@@ -1,0 +1,449 @@
+import os
+import re
+import sys
+import enum
+import shutil
+import argparse
+import subprocess
+import logging
+import dataclasses
+from pathlib import Path
+
+import dbus
+from pystemd.dbuslib import DBus
+from pystemd.systemd1 import Manager
+
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)-8s %(message)s')
+
+
+class SystemctlError(Exception):
+    pass
+
+
+class DynamicMenuError(Exception):
+    pass
+
+
+class TerminalError(Exception):
+    pass
+
+
+class NotificationType(enum.Enum):
+    Info = 0
+    Warn = 1
+    Error = 2
+
+
+@dataclasses.dataclass
+class UnitInfo:
+    id: str
+    substate: str
+    is_user: bool
+
+
+@dataclasses.dataclass
+class Context:
+    is_user: bool
+    bus: DBus
+    manager: Manager
+    path_to_terminal: str
+    path_to_posix_shell: str
+
+
+TERMINAL_LIST = [
+    "x-terminal-emulator",
+    "mate-terminal",
+    "gnome-terminal",
+    "terminator",
+    "xfce4-terminal",
+    "urxvt",
+    "rxvt",
+    "termit",
+    "aterm",
+    "uxterm",
+    "xterm",
+    "roxterm",
+    "termite",
+    "lxterminal",
+    "terminology",
+    "st",
+    "qterminal",
+    "lilyterm",
+    "tilix",
+    "terminix",
+    "konsole",
+    "kitty",
+    "guake",
+    "tilda",
+    "alacritty",
+    "hyper",
+    "wezterm",
+    "rio"
+]
+
+
+def get_notify_interface():
+    # Check existence of interface
+    try:
+        dbus.SessionBus().list_names()\
+                         .index("org.freedesktop.Notifications")  # type: ignore
+    except ValueError:
+        logging.warning("D-Bus object for notifications not exists!")
+        return
+
+    object = dbus.SessionBus().get_object("org.freedesktop.Notifications",
+                                          "/org/freedesktop/Notifications")
+    notify_interface = dbus.Interface(object, "org.freedesktop.Notifications")
+
+    return notify_interface
+
+
+def send_notification_about_success(headline, text):
+    notify_interface = get_notify_interface()
+
+    icon_name = "dialog-info"
+    notify_interface.Notify(  # type: ignore
+        "dmenu_systemd", 0, icon_name,
+        headline, text,
+        [], {"urgency": NotificationType.Info.value}, 3000
+    )
+
+
+def send_error_notification(headline, text):
+    notify_interface = get_notify_interface()
+
+    icon_name = "dialog-warning"
+    notify_interface.Notify(  # type: ignore
+        "dmenu_systemd", 0, icon_name,
+        headline, text,
+        [], {"urgency": NotificationType.Error.value}, 3000
+    )
+
+
+def show_menu(dmenu_command: list[str], lines: list[str]) -> str:
+    process = subprocess.Popen(
+        dmenu_command,
+        stdout=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    concatenated_lines = "\n".join(lines)
+    selected_line, errors = process.communicate(
+        input=concatenated_lines.encode()
+    )
+
+    selected_line = selected_line.decode().strip()
+    errors = errors.decode().strip()
+
+    if selected_line == "":
+        return ""
+    elif process.returncode != 0:
+        logging.warning(errors)
+        send_error_notification("Dynamic menu error!",
+                                "Return code: {}".format(process.returncode))
+
+        raise DynamicMenuError()
+
+    return selected_line
+
+
+def run_command(cmd: list[str]):
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=os.environ
+    )
+
+    _, errors = process.communicate()
+    errors = errors.decode().strip()
+
+    if process.returncode != 0:
+        logging.error(errors)
+        send_error_notification(
+            "Terminal error!",
+            f"Return code: {process.returncode}.\n{errors}"
+        )
+
+        raise TerminalError()
+
+
+def run_command_in_terminal(
+    path_to_terminal: str,
+    cmd: list[str]
+):
+    process = subprocess.Popen(
+        [
+            path_to_terminal,
+            "-e"
+        ] + cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+
+        # Environment variables to enable colors in less
+        env={
+            "SYSTEMD_COLORS": "1",
+            "LESS": "-R"
+        } | os.environ
+    )
+
+    _, errors = process.communicate()
+    errors = errors.decode().strip()
+
+    if process.returncode != 0:
+        logging.error(errors)
+        send_error_notification(
+            "Terminal error!",
+            f"Return code: {process.returncode}.\n{errors}"
+        )
+
+        raise TerminalError()
+
+
+def run_command_in_posix_shell_and_terminal(
+    path_to_terminal: str,
+    path_to_posix_shell: str,
+    cmd: list[str]
+):
+    result_command = [
+        path_to_posix_shell,
+        "-c",
+        " ".join(cmd)
+    ]
+
+    run_command_in_terminal(path_to_terminal, result_command)
+
+
+def list_all_services(manager: Manager) -> list[str]:
+    units = []
+    for unit_path, state in manager.Manager.ListUnitFiles():
+        state = state.decode()
+        unit_path = unit_path.decode()
+        if re.match(R".+\.service", unit_path):
+            units.append(Path(unit_path).name)
+
+    return units
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-d", "--dmenu-command", type=str, action="store",
+        default="wofi --dmenu --gtk-dark --insensitive",
+        help="Command that invokes dmenu-like menu that will be used to show lines."
+    )
+    parser.add_argument("-u", "--user", action="store_true",
+                        help="Show only user services.")
+
+    args = parser.parse_args()
+
+    return args
+
+
+def get_path_to_terminal() -> str:
+    try:
+        environment_term = [os.environ["TERMINAL"]]
+    except KeyError:
+        environment_term = []
+
+    for terminal_name in environment_term + TERMINAL_LIST:
+        path = shutil.which(terminal_name)
+        if path is not None:
+            logging.info("{} terminal found".format(terminal_name))
+            return path
+    else:
+        send_error_notification("Can't find terminal!",
+                                "Install any terminal emulator.")
+        raise TerminalError()
+
+
+def get_path_to_posix_shell() -> str:
+    return "/bin/sh"
+
+
+def show_service(service_name: str, ctx: Context):
+    run_command_in_terminal(
+        ctx.path_to_terminal,
+        [
+            "systemctl",
+            "show",
+            service_name
+        ] + ["--user"] if ctx.is_user else []
+    )
+
+
+def restart_service(service_name: str, ctx: Context):
+    command = [
+        "systemctl",
+        "restart",
+        service_name
+    ]
+    if ctx.is_user:
+        command.append("--user")
+
+    run_command(command)
+
+
+def start_service(service_name: str, ctx: Context):
+    command = [
+        "systemctl",
+        "start",
+        service_name
+    ]
+    if ctx.is_user:
+        command.append("--user")
+
+    run_command(command)
+
+
+def stop_service(service_name: str, ctx: Context):
+    command = [
+        "systemctl",
+        "stop",
+        service_name
+    ]
+    if ctx.is_user:
+        command.append("--user")
+
+    run_command(command)
+
+
+def show_service_status(service_name: str, ctx: Context):
+    internal_command = [
+        "systemctl",
+        "status",
+        service_name
+    ]
+    if ctx.is_user:
+        internal_command.append("--user")
+
+    internal_command.extend([
+        "|",
+        "less"
+    ])
+
+    run_command_in_posix_shell_and_terminal(
+        ctx.path_to_terminal,
+        ctx.path_to_posix_shell,
+        internal_command
+    )
+
+
+def show_service_logs(service_name: str, ctx: Context):
+    internal_command = [
+        "journalctl",
+        "--reverse",
+        "--unit",
+        service_name,
+    ]
+    if ctx.is_user:
+        internal_command.append("--user")
+
+    internal_command.extend([
+        "|",
+        "less"
+    ])
+
+    run_command_in_posix_shell_and_terminal(
+        ctx.path_to_terminal,
+        ctx.path_to_posix_shell,
+        internal_command
+    )
+
+
+def enable_service(service_name: str, ctx: Context):
+    command = [
+        "systemctl",
+        "enable",
+        service_name
+    ]
+    if ctx.is_user:
+        command.append("--user")
+
+    run_command(command)
+
+
+def disable_service(service_name: str, ctx: Context):
+    command = [
+        "systemctl",
+        "disable",
+        service_name
+    ]
+    if ctx.is_user:
+        command.append("--user")
+
+    run_command(command)
+
+
+def main():
+    args = parse_arguments()
+    dmenu_command = args.dmenu_command.split(" ")
+
+    with (
+        DBus() as system_bus,
+        DBus(user_mode=True) as user_bus,
+        Manager(bus=system_bus) as system_manager,  # type: ignore
+        Manager(bus=user_bus) as user_manager       # type: ignore
+    ):
+        if args.user:
+            selected = "user"
+        else:
+            selected = show_menu(dmenu_command, ["System", "User"]).lower()
+
+        if selected == "user":
+            is_user = True
+            bus = user_bus
+            manager = user_manager
+        elif selected == "system":
+            is_user = False
+            bus = system_bus
+            manager = system_manager
+        else:
+            send_error_notification("Unsupported service type!",
+                                    "Only system or user units supported.")
+            return 1
+
+        services = list_all_services(manager)
+
+        selected_service = show_menu(dmenu_command, services).strip()
+        logging.info(f"Selected service: {selected_service}")
+        if selected_service == "":
+            return 1
+
+        actions = {
+            "show": show_service,
+            "restart": restart_service,
+            "start": start_service,
+            "stop": stop_service,
+            "status": show_service_status,
+            "logs": show_service_logs,
+            "enable": enable_service,
+            "disable": disable_service
+        }
+        action_name = show_menu(
+            dmenu_command,
+            [action.capitalize() for action in actions.keys()]
+        ).lower()
+        logging.info(f"Selected action: {action_name}")
+
+        path_to_terminal = get_path_to_terminal()
+        logging.info(f"Path to terminal: {path_to_terminal}")
+
+        path_to_posix_shell = get_path_to_posix_shell()
+        logging.info(f"Path to posix shell: {path_to_posix_shell}")
+
+        context = Context(is_user, bus, manager, path_to_terminal, path_to_posix_shell)
+
+        try:
+            actions[action_name](selected_service, context)
+        except KeyError:
+            send_error_notification("Unsupported action!", "")
+            return 2
+
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
