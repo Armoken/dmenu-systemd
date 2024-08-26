@@ -5,5 +5,5 @@ setup(name='dmenu-systemd',
       # Modules to import from other scripts:
       packages=find_packages(),
       # Executables
-      scripts=["dmenu-systemd.py"],
+      scripts=["dmenu-systemd"],
      )

@@ -30,7 +30,6 @@
         ps.dbus-python
       ])).overrideAttrs (args: { ignoreCollisions = true; doCheck = false; }));
     in {
-      defaultApp     = dmenu-systemd;
       defaultPackage = dmenu-systemd;
       devShell       = pkgs.mkShell {
         nativeBuildInputs = [
