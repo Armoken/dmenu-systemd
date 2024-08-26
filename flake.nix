@@ -17,7 +17,8 @@
         version = "1.0";
 
         propagatedBuildInputs = with pkgs.python3Packages; [
-          flask
+          pystemd
+          dbus-python
         ];
 
         src = ./.;
