@@ -14,7 +14,7 @@
       };
       dmenu-systemd = pkgs.python3Packages.buildPythonApplication {
         pname = "dmenu-systemd";
-        version = "1.0";
+        version = "1.1";
 
         pyproject = true;
         build-system = [ pkgs.python3Packages.setuptools ];
