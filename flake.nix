@@ -16,6 +16,9 @@
         pname = "dmenu-systemd";
         version = "1.0";
 
+        pyproject = true;
+        build-system = [ pkgs.python3Packages.setuptools ];
+
         propagatedBuildInputs = with pkgs.python3Packages; [
           pystemd
           dbus-python
@@ -23,7 +26,7 @@
 
         src = ./.;
       };
-      python-with-packages = ((pkgs.python3Full.withPackages(ps: [
+      python-with-packages = ((pkgs.python3.withPackages(ps: [
         ps.ipython # IPython: Productive Interactive Computing.
 
         ps.pystemd
